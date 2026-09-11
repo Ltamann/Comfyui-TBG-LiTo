@@ -7,6 +7,7 @@ from aiohttp import web
 import folder_paths
 import nodes
 import torch
+import comfy.utils
 from comfy_api.latest import ComfyExtension, IO, InputImpl, Types, UI
 from comfy_extras.nodes_gaussian_splat import File3DToSplat, RenderSplat, _mat_to_quat, _quat_to_mat
 from comfy_extras.nodes_save_3d import mesh_item_to_glb_bytes
@@ -52,18 +53,32 @@ def _valid_preview_file(model_file):
     return model_file
 
 
-def _file_for_preview(model_3d):
+def _persistent_model_file(model_3d):
     if model_3d.format not in {"gltf", "glb", "obj", "fbx", "stl", "ply", "spz", "splat", "ksplat"}:
         raise ValueError(f"Unsupported 3D viewer format: {model_3d.format!r}")
     digest = hashlib.sha256(model_3d.get_bytes()).hexdigest()
     filename = f"trellis2_model_{digest}.{model_3d.format}"
-    path = Path(folder_paths.get_temp_directory()) / filename
+    path = Path(folder_paths.get_output_directory()) / filename
     if not path.is_file():
         model_3d.save_to(str(path))
-    return f"{filename} [temp]"
+    return f"{filename} [output]"
 
 
 _SPLAT_FORMATS = {"ply", "splat", "spz", "ksplat"}
+_SUPER_SAMPLE = 2
+
+
+def _lanczos_resize(value, width, height):
+    if value is None:
+        return value
+    source_height, source_width = value.shape[1:3]
+    if (source_height, source_width) == (height, width):
+        return value
+    if value.ndim == 4:
+        return comfy.utils.common_upscale(value.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+    if value.ndim == 3:
+        return comfy.utils.common_upscale(value.unsqueeze(1), width, height, "lanczos", "disabled").squeeze(1)
+    raise ValueError(f"Expected an image or mask tensor, got shape {tuple(value.shape)}")
 
 
 def _apply_model_info_to_splat(splat, model_3d_info):
@@ -94,11 +109,7 @@ def _apply_model_info_to_splat(splat, model_3d_info):
     return type(splat)(positions, scales, rotations, splat.opacities, splat.sh, counts=splat.counts)
 
 
-def _render_splat_outputs(model_3d, camera_info, width, height, background_image=None, model_3d_info=None):
-    if model_3d is None or (model_3d.format or "").lower() not in _SPLAT_FORMATS:
-        return None
-
-    splat = _apply_model_info_to_splat(File3DToSplat.execute(model_3d).result[0], model_3d_info)
+def _render_splat_outputs_at(splat, camera_info, width, height, background_image=None):
     options = dict(
         splat=splat,
         width=width,
@@ -114,6 +125,23 @@ def _render_splat_outputs(model_3d, camera_info, width, height, background_image
     color = RenderSplat.execute(**options, render_style="color", bg_image=background_image)
     normal = RenderSplat.execute(**options, render_style="normal")
     return color.result[0], 1.0 - color.result[1], normal.result[0]
+
+
+def _render_splat_outputs(model_3d, camera_info, width, height, background_image=None, model_3d_info=None):
+    if model_3d is None or (model_3d.format or "").lower() not in _SPLAT_FORMATS:
+        return None
+
+    splat = _apply_model_info_to_splat(File3DToSplat.execute(model_3d).result[0], model_3d_info)
+    render_width, render_height = width * _SUPER_SAMPLE, height * _SUPER_SAMPLE
+    try:
+        outputs = _render_splat_outputs_at(splat, camera_info, render_width, render_height, background_image)
+    except (MemoryError, torch.OutOfMemoryError):
+        outputs = _render_splat_outputs_at(splat, camera_info, width, height, background_image)
+    except RuntimeError as error:
+        if "out of memory" not in str(error).lower():
+            raise
+        outputs = _render_splat_outputs_at(splat, camera_info, width, height, background_image)
+    return tuple(_lanczos_resize(value, width, height).clamp(0, 1) for value in outputs)
 
 
 class Trellis2PreviewUI(UI.PreviewUI3D):
@@ -143,7 +171,7 @@ def _output_model_files():
     return [
         path.name
         for path in output_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".gltf", ".glb", ".obj", ".fbx", ".stl", ".ply"}
+        if path.is_file() and path.suffix.lower() in {".gltf", ".glb", ".obj", ".fbx", ".stl", ".ply", ".spz", ".splat", ".ksplat"}
     ]
 
 
@@ -158,15 +186,16 @@ class Trellis2Load3D(IO.ComfyNode):
             for path in input_dir.rglob("*")
             if path.suffix.lower() in {".gltf", ".glb", ".obj", ".fbx", ".stl", ".spz", ".splat", ".ply", ".ksplat"}
         ]
+        output_files = [f"{name} [output]" for name in _output_model_files()]
 
         return IO.Schema(
             node_id="Trellis2Load3D",
-            display_name="TBG Preview Splat or 3D & Animation",
+            display_name="Composit 3D mesh o Splat on Background",
             category="3d",
             is_experimental=True,
             is_output_node=True,
             inputs=[
-                IO.Combo.Input("model_file", options=["none"] + sorted(files), upload=IO.UploadType.model),
+                IO.Combo.Input("model_file", options=["none"] + sorted(files + output_files), upload=IO.UploadType.model),
                 IO.Load3D.Input("image"),
                 IO.Mesh.Input("mesh", optional=True,
                               tooltip="Optional mesh input. When connected, it is used instead of model_file."),
@@ -208,6 +237,8 @@ class Trellis2Load3D(IO.ComfyNode):
 
     @classmethod
     def execute(cls, model_file, image, width, height, background_image=None, mesh=None, model_3d=None, **kwargs):
+        if isinstance(image, str) and image:
+            image = json.loads(image)
         if background_image is not None:
             height, width = background_image.shape[1:3]
         splat_outputs = _render_splat_outputs(model_3d, image.get("camera_info"), width, height, background_image,
@@ -219,6 +250,9 @@ class Trellis2Load3D(IO.ComfyNode):
             output_image, _ = load_image_node.load_image(image=image["image"])
             _, output_mask = load_image_node.load_image(image=image["mask"])
             normal_image, _ = load_image_node.load_image(image=image["normal"])
+            output_image = _lanczos_resize(output_image, width, height)
+            output_mask = _lanczos_resize(output_mask, width, height).clamp(0, 1)
+            normal_image = _lanczos_resize(normal_image, width, height)
 
         video = None
         if image.get("recording", ""):
@@ -229,21 +263,24 @@ class Trellis2Load3D(IO.ComfyNode):
         preview_file = None
         if model_3d is not None:
             file_3d = model_3d
-            preview_file = _file_for_preview(model_3d)
+            preview_file = _persistent_model_file(model_3d)
         elif mesh is None and model_file and model_file != "none":
             model_path = Path(folder_paths.get_annotated_filepath(model_file))
             if not model_path.is_file():
                 model_path = Path(folder_paths.get_output_directory()) / model_file
                 model_file = f"{model_file} [output]"
             file_3d = Types.File3D(str(model_path))
+            if model_file.endswith(" [temp]"):
+                model_file = _persistent_model_file(file_3d)
+                preview_file = model_file
             mesh_path = model_file
         elif mesh is not None:
             glb = mesh_item_to_glb_bytes(mesh, 0)
             if glb is None:
-                raise ValueError("TBG Preview Splat or 3D & Animation: mesh is empty (no vertices/faces).")
+                raise ValueError("Composit 3D mesh o Splat on Background: mesh is empty (no vertices/faces).")
             file_3d = Types.File3D(BytesIO(glb), file_format="glb")
             mesh_path = ""
-            preview_file = _file_for_preview(file_3d)
+            preview_file = _persistent_model_file(file_3d)
 
         preview_ui = Trellis2PreviewUI(
             preview_file or model_file or "none", image["camera_info"], background_image, width, height
@@ -275,7 +312,8 @@ class Trellis2Load3DLegacy:
             for path in input_dir.rglob("*")
             if path.suffix.lower() in {".gltf", ".glb", ".obj", ".fbx", ".stl", ".spz", ".splat", ".ply", ".ksplat"}
         ]
-        model_files = sorted(set(files + _output_model_files()))
+        output_files = _output_model_files()
+        model_files = sorted(set(files + output_files + [f"{name} [output]" for name in output_files]))
         return {
             "required": {
                 "model_file": (["none"] + model_files, {"upload": "model"}),
@@ -322,11 +360,11 @@ class Trellis2Load3DLegacy:
             if file_3d is None and mesh is not None:
                 glb = mesh_item_to_glb_bytes(mesh, 0)
                 if glb is None:
-                    raise ValueError("TBG Preview Splat or 3D & Animation: mesh is empty (no vertices/faces).")
+                    raise ValueError("Composit 3D mesh o Splat on Background: mesh is empty (no vertices/faces).")
                 file_3d = Types.File3D(BytesIO(glb), file_format="glb")
             preview_file = _valid_preview_file(model_file)
             if file_3d is not None:
-                preview_file = _file_for_preview(file_3d)
+                preview_file = _persistent_model_file(file_3d)
             preview_ui = Trellis2PreviewUI(preview_file, {}, viewer_background, width, height)
             result_args = (
                 background_image,

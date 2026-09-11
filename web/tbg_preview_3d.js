@@ -3,9 +3,51 @@ import { api } from "../../scripts/api.js";
 
 const viewerControllers = new WeakMap();
 const guardedViewers = new WeakSet();
+const guardedViewerContainers = new WeakSet();
 const backgroundLoads = new WeakMap();
 
-function guardViewerBackground(load3d) {
+const TBG_NODE_ID = "Trellis2Load3D";
+const TBG_DISPLAY_NAME = "Composit 3D mesh o Splat on Background";
+const CAPTURE_SCALE = 2;
+
+function guardViewerEvents(container) {
+    if (!container || guardedViewerContainers.has(container)) return;
+    guardedViewerContainers.add(container);
+    container.addEventListener("pointerdown", (event) => event.stopPropagation());
+}
+
+function disableViewerInertia(load3d) {
+    const controls = load3d.controlsManager?.controls;
+    if (!controls) return;
+    controls.enableDamping = false;
+    controls.update();
+}
+
+function snapshotViewerCamera(node, load3d) {
+    const camera = node.properties?.["Camera Config"] || {};
+    const state = load3d.getCameraState?.() || camera.state;
+    const snapshot = {
+        ...camera,
+        cameraType: load3d.getCurrentCameraType?.() || camera.cameraType,
+        fov: load3d.cameraManager?.perspectiveCamera?.fov ?? camera.fov,
+        state: state ? structuredClone(state) : state,
+    };
+    node.properties ||= {};
+    node.properties["Camera Config"] = snapshot;
+    return snapshot;
+}
+
+function restoreViewerCamera(node, load3d, camera) {
+    if (!camera) return;
+    if (camera.cameraType) load3d.toggleCamera(camera.cameraType);
+    if (camera.fov != null) load3d.setFOV(camera.fov);
+    if (camera.state) load3d.setCameraState(structuredClone(camera.state));
+    load3d.forceRender?.();
+    node.properties ||= {};
+    node.properties["Camera Config"] = camera;
+}
+
+function guardViewerBackground(node, load3d) {
     if (guardedViewers.has(load3d)) return;
     guardedViewers.add(load3d);
     const scene = load3d.getSceneManager();
@@ -29,7 +71,9 @@ function guardViewerBackground(load3d) {
         if (pendingPath === path) return pending;
         if (pendingPath === undefined && loadedPath === path && scene.backgroundTexture) return pending;
         const next = pending.catch(() => {}).then(async () => {
+            const camera = snapshotViewerCamera(node, load3d);
             await setBackgroundImage(path);
+            restoreViewerCamera(node, load3d, camera);
             loadedPath = scene.backgroundTexture ? path : undefined;
         });
         pendingPath = path;
@@ -45,6 +89,19 @@ function guardViewerBackground(load3d) {
 function getViewerController(node, modules) {
     if (!viewerControllers.has(node)) viewerControllers.set(node, modules.useLoad3d(node));
     return viewerControllers.get(node);
+}
+
+function installViewerOutputSerializer(node) {
+    const imageWidget = node.widgets?.find((widget) => widget.name === "image");
+    if (!imageWidget || imageWidget.__trellis2SerializeGuard) return;
+
+    const originalSerializeValue = imageWidget.serializeValue;
+    imageWidget.__trellis2SerializeGuard = true;
+    imageWidget.serializeValue = async function (...args) {
+        await node.__trellis2ViewerInitPromise;
+        if (imageWidget.__trellis2CaptureOutputs) return imageWidget.__trellis2CaptureOutputs();
+        return originalSerializeValue?.apply(this, args) ?? imageWidget.value;
+    };
 }
 
 function isTemporaryPath(value) {
@@ -89,6 +146,15 @@ function getPreviewResult(message) {
     return message?.ui?.result ?? output?.ui?.result ?? output?.result;
 }
 
+async function captureSceneAtQuality(load3d, width, height) {
+    try {
+        return await load3d.captureScene(width * CAPTURE_SCALE, height * CAPTURE_SCALE);
+    } catch (error) {
+        console.warn("Trellis2: supersampled capture failed; retrying at output size", error);
+        return load3d.captureScene(width, height);
+    }
+}
+
 async function getNativeLoad3D() {
     if (!getNativeLoad3D.promise) {
         getNativeLoad3D.promise = (async () => {
@@ -119,12 +185,7 @@ async function saveViewerState(node) {
     const modules = await getNativeLoad3D();
     const load3d = await new Promise((resolve) => getViewerController(node, modules).waitForLoad3d(resolve));
         node.properties ||= {};
-        const camera = node.properties["Camera Config"] || {};
-        node.properties["Camera Config"] = {
-            ...camera,
-            cameraType: load3d.getCurrentCameraType?.() || camera.cameraType,
-            state: load3d.getCameraState?.() || camera.state,
-        };
+        snapshotViewerCamera(node, load3d);
 
         const gizmo = load3d.getGizmoTransform?.();
         if (gizmo) {
@@ -137,6 +198,25 @@ async function saveViewerState(node) {
                 },
             };
         }
+}
+
+function preserveCameraDuringModelLoads(node, load3d, modelWidget, modules) {
+    const loadModel = modelWidget.callback;
+    modelWidget.callback = (value) => {
+        const modelFile = typeof value === "string" ? value.replaceAll("\\", "/") : value;
+        if (modelFile === node.__tbgLoadedModelPath && load3d.getCurrentModel?.()) {
+            return node.__tbgCameraRestorePromise || Promise.resolve();
+        }
+        const camera = snapshotViewerCamera(node, load3d);
+        loadModel?.(value);
+        const restore = load3d.whenLoadIdle().then(() => {
+            restoreViewerCamera(node, load3d, camera);
+            node.__tbgLoadedModelPath = load3d.getCurrentModel() ? modelFile : undefined;
+            modules.markSceneDirty(node);
+        });
+        node.__tbgCameraRestorePromise = restore;
+        return restore;
+    };
 }
 
 function bindViewerOutputs(node, load3d, modules) {
@@ -181,7 +261,7 @@ function bindViewerOutputs(node, load3d, modules) {
                 model_3d_info: state.model_3d_info,
             };
         }
-        const captured = await load3d.captureScene(width, height);
+        const captured = await captureSceneAtQuality(load3d, width, height);
         const [scene, mask, normal] = await Promise.all([
             modules.Load3dUtils.uploadTempImage(captured.scene, "scene"),
             modules.Load3dUtils.uploadTempImage(captured.mask, "scene_mask"),
@@ -200,10 +280,12 @@ function bindViewerOutputs(node, load3d, modules) {
         modules.setOutputCache(node, result);
         return result;
     };
-    imageWidget.serializeValue = () => {
+    const serializeCapture = () => {
         capturePromise ||= capture().finally(() => { capturePromise = null; });
         return capturePromise;
     };
+    imageWidget.__trellis2CaptureOutputs = serializeCapture;
+    if (!imageWidget.__trellis2SerializeGuard) imageWidget.serializeValue = serializeCapture;
     imageWidget.__trellis2ViewerOutputs = load3d;
 }
 
@@ -214,7 +296,10 @@ async function configureNativeViewerNow(node, loadFolder = "input", preview = nu
     const modules = await getNativeLoad3D();
     const { Load3DConfiguration } = modules;
     const load3d = await new Promise((resolve) => getViewerController(node, modules).waitForLoad3d(resolve));
-    guardViewerBackground(load3d);
+    disableViewerInertia(load3d);
+    guardViewerBackground(node, load3d);
+    node.__tbgViewerContainer = load3d.domElement?.parentElement;
+    guardViewerEvents(node.__tbgViewerContainer);
     bindViewerOutputs(node, load3d, modules);
     if (preview?.size) {
         for (const name of ["width", "height"]) {
@@ -243,13 +328,9 @@ async function configureNativeViewerNow(node, loadFolder = "input", preview = nu
             if (modelFile && modelFile !== "none"
                 && (modelFile !== node.__tbgLoadedModelPath || modelMissing)) {
                 await saveViewerState(node);
-                const cameraState = load3d.getCameraState?.();
                 modelWidget.value = modelFile;
-                await load3d.whenLoadIdle();
-                if (cameraState) {
-                    load3d.setCameraState(cameraState);
-                    load3d.forceRender?.();
-                }
+                await (node.__tbgCameraRestorePromise || load3d.whenLoadIdle());
+                load3d.forceRender?.();
                 node.__tbgLoadedModelPath = load3d.getCurrentModel() ? modelFile : undefined;
                 modules.markSceneDirty(node);
             }
@@ -291,11 +372,10 @@ async function configureNativeViewerNow(node, loadFolder = "input", preview = nu
                 node.setDirtyCanvas?.(true, true);
             },
         });
+        preserveCameraDuringModelLoads(node, load3d, modelWidget, modules);
         if (modelFile && modelFile !== "none") {
-            const cameraState = node.properties["Camera Config"]?.state;
             modelWidget.value = modelFile;
-            await load3d.whenLoadIdle();
-            if (cameraState) load3d.setCameraState(cameraState);
+            await (node.__tbgCameraRestorePromise || load3d.whenLoadIdle());
             node.__tbgLoadedModelPath = load3d.getCurrentModel() ? modelFile : undefined;
         }
         const backgroundPath = preview?.backgroundPath || node.properties["Scene Config"]?.backgroundImage;
@@ -402,7 +482,9 @@ app.registerExtension({
     name: "Trellis2.Load3D",
 
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== "Trellis2Load3D") return;
+        if (nodeData.name !== TBG_NODE_ID
+            && nodeData.name !== TBG_DISPLAY_NAME
+            && nodeData.display_name !== TBG_DISPLAY_NAME) return;
 
         nodeType.trellis2Load3D = true;
 
@@ -410,6 +492,7 @@ app.registerExtension({
         const originalOnExecuted = nodeType.prototype.onExecuted;
         nodeType.prototype.onNodeCreated = function () {
             const output = originalOnNodeCreated?.apply(this, arguments);
+            installViewerOutputSerializer(this);
             initializeNativeViewer(this);
             return output;
         };
@@ -430,6 +513,7 @@ app.registerExtension({
 
     loadedGraphNode(node) {
         if (isTrellisLoad3D(node)) {
+            installViewerOutputSerializer(node);
             initializeNativeViewer(node);
         }
     },
